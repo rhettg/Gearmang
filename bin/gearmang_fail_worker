@@ -1,0 +1,62 @@
+#!python
+import logging
+import datetime
+
+import sqlalchemy.exc
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from gearmang import models
+from gearmang import cmd
+from gearmang.worker import TASK_GEARMAN_FAIL
+
+log = logging.getLogger(__name__)
+
+def handle_gearman_fail(worker, job):
+    queue_time = datetime.datetime.fromtimestamp(job.data['time'])
+    log.info("Handling %s task for task queue %s queued at %s", job.task, job.data['task'], queue_time)
+    session = worker.sessionmaker()
+    fail = models.FailedGearmanJob()
+
+    for key in ('unique_key', 'task', 'data', 'exception'):
+        setattr(fail, key, job.data[key])
+
+    fail.time_failed = datetime.datetime.fromtimestamp(job.data['time'])
+
+    session.add(fail)
+    try:
+        session.commit()
+    except sqlalchemy.exc.IntegrityError, e:
+        log.warning("Integrity Error, probably a duplicate unique key: %r", e)
+        session.rollback()
+
+    sns.send_notification("Gearman task for %s failed" % job.data['task'], job.data['exception'], channel=sns.ALERT)
+
+    log.info("Done handling task")
+
+def configure(option_parser):
+    option_parser.description = "Gearman worker for processing failed gearman jobs"
+    option_parser.add_argument('--db-path', '-d', dest='db_path', action='store', required=True)
+    option_parser.add_argument('--hosts', dest='hosts', action='store', required=True)
+
+def run(options):
+    gm_worker = gearmang.Worker(options.hosts)
+    
+    gm_worker.register_task(TASK_GEARMAN_FAIL, handle_gearman_fail)
+
+    engine = create_engine("sqlite:///%s" % options.db_path)
+    gm_worker.sessionmaker = sessionmaker(bind=engine)
+
+    # Create our table if it doesn't exist
+    try:
+        models.FailedGearmanJob.__table__.create(engine)
+    except sqlalchemy.exc.OperationalError, e:
+        if 'already exists' in e.message:
+            pass
+        else:
+            raise
+
+    gm_worker.work(poll_timeout=60)
+
+if __name__ == '__main__':
+    cmd.main(configure, run)

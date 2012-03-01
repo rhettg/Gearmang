@@ -1,0 +1,123 @@
+#!python
+import sys
+import argparse
+import logging
+import json
+
+import sqlalchemy.orm
+
+from gearmang import cmd
+from gearmang import models
+
+log = logging.getLogger(__name__)
+
+
+def list_failed_jobs(db_path):
+    engine = sqlalchemy.create_engine("sqlite:///%s" % db_path)
+    session = sqlalchemy.orm.sessionmaker(bind=engine)()
+
+    for failed_job in session.query(gearmang.FailedGearmanJob).all():
+        print "%24s %s %s" % (failed_job.task, failed_job.unique_key, failed_job.time_failed)
+    return True
+
+def show_failed_job(db_path, unique_key):
+    engine = sqlalchemy.create_engine("sqlite:///%s" % db_path)
+    session = sqlalchemy.orm.sessionmaker(bind=engine)()
+
+    failed_job = session.query(models.FailedGearmanJob).filter(models.FailedGearmanJob.unique_key.like(unique_key + '%')).first()
+    if not failed_job:
+        print "No job %s" % unique_key
+        return False
+
+    print "   Key: %s" % failed_job.unique_key
+    print "  Task: %s" % failed_job.task
+    print "Failed: %s" % failed_job.time_failed
+    print "-" * 48
+    print failed_job.exception
+    return True
+
+def requeue_failed_job(db_path, unique_key):
+    engine = sqlalchemy.create_engine("sqlite:///%s" % db_path)
+    session = sqlalchemy.orm.sessionmaker(bind=engine)()
+
+    failed_job = session.query(models.FailedGearmanJob).filter(models.FailedGearmanJob.unique_key.like(unique_key + '%')).first()
+    if not failed_job:
+        print "Missing job"
+        return False
+
+    client = gearmang.build_client()
+
+    client.submit_job(
+                      str(failed_job.task), 
+                      json.loads(failed_job.data), 
+                      background=True, 
+                      poll_timeout=gearmang.GEARMAN_TIMEOUT,
+                      unique=str(failed_job.unique_key)
+                      )
+    print "Job %s requeued" % (failed_job.unique_key,)
+
+    session.delete(failed_job)
+    session.commit()
+    return True
+
+def drop_failed_job(db_path, unique_key):
+    engine = sqlalchemy.create_engine("sqlite:///%s" % db_path)
+    session = sqlalchemy.orm.sessionmaker(bind=engine)()
+
+    failed_job = session.query(models.FailedGearmanJob).filter(models.FailedGearmanJob.unique_key.like(unique_key + '%')).first()
+    if not failed_job:
+        print "Missing job"
+        return False
+
+    session.delete(failed_job)
+    session.commit()
+    print "Job %s removed" % failed_job.unique_key
+    return True
+
+def main():
+    parser = argparse.ArgumentParser(description='Script for managing gearman tasks')
+    parser.add_argument('action', choices=['fail_requeue', 'fail_list', 'fail_show', 'fail_drop'], type=str, action='store')
+    parser.add_argument('--db-path', dest='db_path', type=str, action='store', default=None)
+    parser.add_argument('--unique-key', dest='unique_key', type=str, action='store', default=None)
+    cmd.default_arguments(parser)
+
+    options = parser.parse_args()
+    
+    cmd.setup_logging(options)
+
+    log.info("Starting")
+
+    session = sqlalchemy.orm.sessionmaker(bind=engine)()
+    
+    ok = True
+    if options.action == 'fail_list':
+        if not options.db_path:
+            parser.error("Path to db required")
+        ok = list_failed_jobs(options.db_path)
+    elif options.action == 'fail_show':
+        if not options.db_path:
+            parser.error("Path to db required")
+        if not options.unique_key:
+            parser.error("Unique Key must be specified")
+        ok = show_failed_job(options.db_path, options.unique_key)
+    elif options.action == 'fail_requeue':
+        if not options.db_path:
+            parser.error("Path to db required")
+        if not options.unique_key:
+            parser.error("Unique Key must be specified")
+        ok = requeue_failed_job(options.db_path, options.unique_key)
+    elif options.action == 'fail_drop':
+        if not options.db_path:
+            parser.error("Path to db required")
+        if not options.unique_key:
+            parser.error("Unique Key must be specified")
+        ok = drop_failed_job(options.db_path, options.unique_key)
+    else:
+        parser.error("invalid action")
+
+    if not ok:
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
